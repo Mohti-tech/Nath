@@ -293,6 +293,7 @@ body.caps .word{text-transform:uppercase}
 <div id="pause" class="overlay" hidden style="background:rgba(30,42,74,.92);color:#fff;text-align:center;font-size:34px;z-index:70"><div>😴<br>C’est l’heure de la pause !<br><small style="font-size:16px;font-family:var(--body)">Parents : maintenez l’écran 3 secondes pour reprendre</small></div></div>
 <canvas id="fx"></canvas>
 
+<script src="tts-bridge.bundle.js"></script>
 <script>
 (function(){
 'use strict';
@@ -422,7 +423,7 @@ const STARS_PER_STICKER = 5;
 
 /* ---------- Mémoire (sur cet appareil) ---------- */
 const KEY = 'petit-pois-eveil-v1';
-const DEFAULT_SETTINGS = {choices:3, numMax:10, caps:true, rate:0.88, voiceURI:'', sound:true, timer:0, enabled:{}};
+const DEFAULT_SETTINGS = {choices:3, numMax:10, caps:true, rate:0.88, voiceURI:'', voiceMode:'auto', sound:true, timer:0, enabled:{}};
 let data = {settings:{}, stats:{}, stickers:[]};
 try { const raw = localStorage.getItem(KEY); if (raw) data = Object.assign(data, JSON.parse(raw)); } catch(e) {}
 data.settings = Object.assign({}, DEFAULT_SETTINGS, data.settings || {});
@@ -475,24 +476,39 @@ function onlineTTS(text, fin){
 function speakOne(text, cb, key){
   let done = false, timer = 0, started = false, online = false;
   const fin = () => { if (done) return; done = true; clearTimeout(timer); cb && cb(); };
-  if (key && recs[key] && playRec(key, fin)) return;
-  const est = 900 + text.length * 95 / S.rate;
+  // Les enregistrements parentaux ne sont utilisés que si ce mode est choisi.
+  if (S.voiceMode === 'parents' && key && recs[key] && playRec(key, fin, true)) return;
+  const est = 900 + text.length * 95 / Math.max(0.5, Number(S.rate) || 0.88);
   const goOnline = () => { online = true; clearTimeout(timer); timer = setTimeout(fin, est + 6000); if (!onlineTTS(text, fin)){ clearTimeout(timer); timer = setTimeout(fin, est); } };
-  if (!synth || !frVoices.length){ goOnline(); return; }
-  try {
-    const u = new SpeechSynthesisUtterance(text);
-    u.lang = 'fr-FR'; if (voice) u.voice = voice;
-    u.rate = S.rate; u.pitch = 1; u.volume = 1;
-    u.onstart = () => { started = true; };
-    u.onend = () => { if (!online) fin(); }; u.onerror = () => { if (!online) fin(); };
-    keep.push(u); if (keep.length > 30) keep.shift();
-    synth.speak(u);
-    timer = setTimeout(fin, est + 2500);
+  // Dans l'APK, utiliser le moteur Android natif : il fonctionne même sans speechSynthesis WebView.
+  if (window.NathTTS && window.NathTTS.isNative && window.NathTTS.isNative()){
     const tk = speakToken;
-    setTimeout(() => { if (!started && !done && tk === speakToken){ try { synth.cancel(); } catch(e) {} goOnline(); } }, 1500);
-  } catch(e){ goOnline(); }
+    timer = setTimeout(fin, est + 10000);
+    window.NathTTS.speak(text, S.rate).then(() => { if (tk === speakToken) fin(); }).catch(() => {
+      if (tk !== speakToken || done) return;
+      clearTimeout(timer);
+      if (synth && frVoices.length) speakBrowser(); else goOnline();
+    });
+    return;
+  }
+  function speakBrowser(){
+    try {
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'fr-FR'; if (voice) u.voice = voice;
+      u.rate = S.rate; u.pitch = 1; u.volume = 1;
+      u.onstart = () => { started = true; };
+      u.onend = () => { if (!online) fin(); }; u.onerror = () => { if (!online) fin(); };
+      keep.push(u); if (keep.length > 30) keep.shift();
+      synth.speak(u);
+      timer = setTimeout(fin, est + 2500);
+      const tk = speakToken;
+      setTimeout(() => { if (!started && !done && tk === speakToken){ try { synth.cancel(); } catch(e) {} goOnline(); } }, 1500);
+    } catch(e){ goOnline(); }
+  }
+  if (!synth || !frVoices.length){ goOnline(); return; }
+  speakBrowser();
 }
-function stopVoice(){ speakToken++; try { synth && synth.cancel(); } catch(e) {} if (clip){ try { clip.pause(); } catch(e) {} clip = null; } }
+function stopVoice(){ speakToken++; try { synth && synth.cancel(); } catch(e) {} try { window.NathTTS && window.NathTTS.isNative() && window.NathTTS.stop(); } catch(e) {} if (clip){ try { clip.pause(); } catch(e) {} clip = null; } }
 function say(text, cb, key){
   stopVoice(); const tok = speakToken;
   speakOne(text, () => { if (tok === speakToken && cb) cb(); }, key);
@@ -562,9 +578,9 @@ function resizeImage(file){
 const emoOf = item => imgs['w:' + item.w] ? `<img class="photo" src="${imgs['w:' + item.w]}" alt="">` : (item.svg ? `<span class="svgemo">${item.svg}</span>` : `<span class="emo">${item.e}</span>`);
 function putRec(k, b){ recs[k] = b; delete urls[k]; try { db && db.transaction('v','readwrite').objectStore('v').put(b, k); } catch(e) {} }
 function delRec(k){ delete recs[k]; delete urls[k]; try { db && db.transaction('v','readwrite').objectStore('v').delete(k); } catch(e) {} }
-function playRec(k, cb){
+function playRec(k, cb, fromSpeech){
   const b = recs[k]; if (!b) return false;
-  stopVoice();
+  if (!fromSpeech) stopVoice();
   let done = false; const fin = () => { if (done) return; done = true; cb && cb(); };
   try {
     const a = new Audio(urls[k] || (urls[k] = URL.createObjectURL(b)));
@@ -603,7 +619,7 @@ function recHTML(){
   const cats = CATS.filter(c => c.kind !== 'number');
   const c = cats.find(x => x.id === recCat) || cats[0];
   return `<h3>Ma voix (enregistrement)</h3>
-    <p class="note" style="margin:0">Pour un rendu plus réaliste, ajoutez une vraie photo (📷) à chaque mot : elle remplace le dessin. Pour la voix : appuyez sur Enregistrer, parlez (8 secondes maximum), puis sur Arrêter. Votre voix remplace la voix de synthèse ; sans enregistrement, la synthèse reste utilisée. Les enregistrements restent sur cet appareil.</p>
+    <p class="note" style="margin:0">Pour un rendu plus réaliste, ajoutez une vraie photo (📷) à chaque mot : elle remplace le dessin. Pour la voix : choisissez « Voix des parents » dans les réglages pour utiliser vos enregistrements. En mode « Voix automatique », la voix française du système est utilisée. Si un enregistrement manque, la voix automatique prend le relais. Les enregistrements restent sur cet appareil.</p>
     ${recMsg ? `<p class="note" style="color:#B3261E">${recMsg}</p>` : ''}
     ${REC_PHRASES.map(r => recRow(r[0], r[1])).join('')}
     <div class="setrow"><label for="recCat">Mots à enregistrer</label><select id="recCat">${cats.map(x => `<option value="${x.id}" ${x.id === c.id ? 'selected' : ''}>${x.say.replace('Miam ! ','')}</option>`).join('')}</select></div>
@@ -1078,6 +1094,7 @@ function renderParents(){
     <div class="setrow"><label for="sound">Applaudissements et petits sons</label><input type="checkbox" class="switch" id="sound" ${S.sound ? 'checked' : ''}></div>
     <div class="setrow"><label>Minuteur de jeu</label>${seg('timer', S.timer, [[0,'Sans'],[10,'10 min'],[20,'20 min']])}</div>
     <h3>Voix</h3>
+    <div class="setrow"><label for="voiceMode">Choix de la voix</label><select id="voiceMode"><option value="auto" ${S.voiceMode !== 'parents' ? 'selected' : ''}>Voix automatique</option><option value="parents" ${S.voiceMode === 'parents' ? 'selected' : ''}>Voix des parents</option></select></div>
     <div class="setrow"><label for="rate">Vitesse</label>
       <span style="display:flex;align-items:center;gap:10px"><span class="note">lente</span><input type="range" id="rate" min="0.5" max="1.1" step="0.05" value="${S.rate}"><span class="note">normale</span>
       <button type="button" class="pbtn dark" id="testVoice">Écouter</button></span></div>
@@ -1127,7 +1144,8 @@ $('#sheet').addEventListener('change', e => {
   if (t.id === 'recCat'){ recCat = t.value; rerender(); return; }
   if (t.id === 'impFile' && t.files[0]){ t.files[0].text().then(x => { const j = JSON.parse(x); if (!j || typeof j !== 'object' || Array.isArray(j)) throw 0; ['settings','stats'].forEach(k => { if (j[k] && (typeof j[k] !== 'object' || Array.isArray(j[k]))) delete j[k]; }); if (!Array.isArray(j.stickers)) delete j.stickers; Object.assign(data, j); save(); location.reload(); }).catch(() => { t.value = ''; }); return; }
   if (t.id === 'sound'){ S.sound = t.checked; save(); return; }
-  if (t.id === 'voiceSel'){ S.voiceURI = t.value; save(); loadVoices(); say('Bonjour ! Je suis Nathanaël.'); }
+  if (t.id === 'voiceSel'){ S.voiceURI = t.value; save(); loadVoices(); say('Bonjour ! Je suis Nathanaël.'); return; }
+  if (t.id === 'voiceMode'){ S.voiceMode = t.value === 'parents' ? 'parents' : 'auto'; save(); say(S.voiceMode === 'parents' ? 'La voix des parents est sélectionnée.' : 'La voix automatique est sélectionnée.'); return; }
 });
 $('#sheet').addEventListener('input', e => { if (e.target.id === 'rate'){ S.rate = +e.target.value; save(); } });
 $('#parents').addEventListener('click', e => { if (e.target.id === 'parents') closeParents(); });
